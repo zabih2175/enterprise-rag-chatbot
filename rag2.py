@@ -277,6 +277,6 @@ if prompt := st.chat_input(f"Ask a question about {client_name}..."):
     )
 
 
-os.getenv("NEXT_PUBLIC_SUPABASE_URL")
-os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+os.getenv("SUPABASE_URL")
+os.getenv("SUPABASE_KEY")
 os.getenv("OPENAI_API_KEY")
