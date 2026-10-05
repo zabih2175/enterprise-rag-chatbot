@@ -14,4 +14,3 @@ token.json
 .env
 *.db
 client_databases/
-.devcontainer/
