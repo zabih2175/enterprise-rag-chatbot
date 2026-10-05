@@ -1,7 +1,8 @@
+import json
 import os
-import streamlit as st
 import openai
 from supabase import create_client, Client
+import streamlit as st
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -11,7 +12,7 @@ from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Load environment variables from .env
+# Load environment variables from .env (for local development)
 load_dotenv()
 
 # Page Config
@@ -19,13 +20,36 @@ st.set_page_config(
     page_title="Enterprise RAG Assistant", page_icon="🏢", layout="wide"
 )
 
-# --- LOAD SECRETS FROM .ENV ---
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# --- AUTOMATIC CREDENTIALS.JSON GENERATOR FOR STREAMLIT CLOUD ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
+
+if not os.path.exists(CREDENTIALS_PATH):
+    try:
+        if "google" in st.secrets:
+            google_data = {
+                "installed": {
+                    "client_id": st.secrets["google"]["client_id"],
+                    "project_id": st.secrets["google"].get("project_id", ""),
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                    "client_secret": st.secrets["google"]["client_secret"],
+                    "redirect_uris": ["http://localhost"]
+                }
+            }
+            with open(CREDENTIALS_PATH, "w") as f:
+                json.dump(google_data, f)
+    except Exception:
+        pass
+
+# --- LOAD SECRETS FROM .ENV OR STREAMLIT SECRETS ---
+SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY or not OPENAI_API_KEY:
-    st.error("Missing credentials in your `.env` file. Please ensure SUPABASE_URL, SUPABASE_KEY, and OPENAI_API_KEY are all set.")
+    st.error("Missing credentials. Please ensure SUPABASE_URL, SUPABASE_KEY, and OPENAI_API_KEY are configured in your `.env` or Streamlit Cloud Secrets.")
     st.stop()
 
 # Initialize Supabase and OpenAI clients
