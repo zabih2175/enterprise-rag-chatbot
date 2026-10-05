@@ -275,3 +275,8 @@ if prompt := st.chat_input(f"Ask a question about {client_name}..."):
     st.session_state[session_key].append(
         {"role": "assistant", "content": response}
     )
+
+
+SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
