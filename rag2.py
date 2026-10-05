@@ -56,6 +56,14 @@ if not SUPABASE_URL or not SUPABASE_KEY or not OPENAI_API_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
+# --- DIRECT SUPABASE CONNECTION TEST ---
+try:
+    supabase.table("client_knowledge_base").select("id", count="exact").execute()
+    print("Supabase connection successful!")
+except Exception as e:
+    print(f"Supabase auth failed: {e}")
+    st.error(f"Supabase Authentication Error: {e}")
+
 
 class SupabaseClientVectorStore:
     """An isolated, permanent vector store backed by Supabase pgvector table with multi-tenant filtering."""
