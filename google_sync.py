@@ -102,3 +102,8 @@ def sync_live_calendar_to_supabase(vector_store, openai_client, max_results=10):
         synced_count += 1
         
     return synced_count
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
+
+flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)

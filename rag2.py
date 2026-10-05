@@ -57,11 +57,11 @@ class SupabaseClientVectorStore:
                 "metadata": {"source": "langchain_upload"},
                 "embedding": emb
             }
-            supabase.table("client_knowledge_base").insert(data).execute()
+            self.client.table("client_knowledge_base").insert(data).execute()
 
     def get_document_count(self):
         try:
-            response = supabase.table("client_knowledge_base") \
+            response = self.client.table("client_knowledge_base") \
                 .select("id", count="exact") \
                 .eq("client_id", self.client_id) \
                 .execute()
@@ -75,7 +75,7 @@ class SupabaseClientVectorStore:
         
         try:
             # 2. Call Supabase RPC function for fast vector search
-            rpc_response = supabase.rpc(
+            rpc_response = self.client.rpc(
                 "match_client_documents",
                 {
                     "query_embedding": query_emb,
@@ -275,8 +275,3 @@ if prompt := st.chat_input(f"Ask a question about {client_name}..."):
     st.session_state[session_key].append(
         {"role": "assistant", "content": response}
     )
-
-
-os.getenv("SUPABASE_URL")
-os.getenv("SUPABASE_KEY")
-os.getenv("OPENAI_API_KEY")
