@@ -10,7 +10,10 @@ wheels/
 .venv
 .env
 credentials.json
-token.json
 .env
 *.db
 client_databases/
+token.json
+credentials.json
+.env
+.streamlit/secrets.toml

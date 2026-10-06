@@ -1,309 +1,340 @@
-import json
 import os
-import openai
-from supabase import create_client, Client
+import tempfile
+
 import streamlit as st
 from dotenv import load_dotenv
+from supabase import Client, create_client
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Load environment variables from .env (for local development)
-load_dotenv()
-
-# Page Config
-st.set_page_config(
-    page_title="Enterprise RAG Assistant", page_icon="🏢", layout="wide"
+from google_sync import (
+    decode_state,
+    exchange_code,
+    get_account_email,
+    get_auth_url,
+    make_flow,
+    sync_calendar,
+    sync_gmail,
 )
 
-# --- AUTOMATIC CREDENTIALS.JSON GENERATOR FOR STREAMLIT CLOUD ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
+load_dotenv()
 
-if not os.path.exists(CREDENTIALS_PATH):
+st.set_page_config(page_title="Enterprise RAG Assistant", page_icon="🏢", layout="wide")
+
+
+# ---------- Config ----------
+def get_secret(name, default=None):
+    value = os.getenv(name)
+    if value:
+        return value
     try:
-        if "google" in st.secrets:
-            google_data = {
-                "installed": {
-                    "client_id": st.secrets["google"]["client_id"],
-                    "project_id": st.secrets["google"].get("project_id", ""),
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                    "client_secret": st.secrets["google"]["client_secret"],
-                    "redirect_uris": ["http://localhost"]
-                }
-            }
-            with open(CREDENTIALS_PATH, "w") as f:
-                json.dump(google_data, f)
+        return st.secrets[name]
     except Exception:
-        pass
+        return default
 
-# --- LOAD SECRETS FROM .ENV OR STREAMLIT SECRETS ---
-SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY or not OPENAI_API_KEY:
-    st.error("Missing credentials. Please ensure SUPABASE_URL, SUPABASE_KEY, and OPENAI_API_KEY are configured in your `.env` or Streamlit Cloud Secrets.")
+def get_google_config():
+    """Google OAuth settings from env vars or the [google] block in secrets."""
+    cid = os.getenv("GOOGLE_CLIENT_ID")
+    secret = os.getenv("GOOGLE_CLIENT_SECRET")
+    redirect = os.getenv("GOOGLE_REDIRECT_URI")
+    if cid and secret and redirect:
+        return cid, secret, redirect
+    try:
+        g = st.secrets["google"]
+        return g["client_id"], g["client_secret"], g["redirect_uri"]
+    except Exception:
+        return None
+
+
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+
+if not (SUPABASE_URL and SUPABASE_KEY and OPENAI_API_KEY):
+    st.error(
+        "Missing credentials. Set SUPABASE_URL, SUPABASE_KEY and OPENAI_API_KEY "
+        "in `.env` or Streamlit secrets."
+    )
     st.stop()
 
-# Initialize Supabase and OpenAI clients
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-# --- DIRECT SUPABASE CONNECTION TEST ---
-try:
-    supabase.table("client_knowledge_base").select("id", count="exact").execute()
-    print("Supabase connection successful!")
-except Exception as e:
-    print(f"Supabase auth failed: {e}")
-    st.error(f"Supabase Authentication Error: {e}")
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 
+@st.cache_resource
+def get_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+@st.cache_resource
+def get_embeddings():
+    return OpenAIEmbeddings(model="text-embedding-3-small")
+
+
+@st.cache_resource
+def get_llm():
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+
+
+supabase = get_supabase()
+
+
+# ---------- Vector store ----------
 class SupabaseClientVectorStore:
-    """An isolated, permanent vector store backed by Supabase pgvector table with multi-tenant filtering."""
+    """Multi-tenant pgvector store: every row is tagged with a client_id."""
 
-    def __init__(self, client_name, embeddings_model):
+    TABLE = "client_knowledge_base"
+    BATCH = 100
+
+    def __init__(self, client_name: str, embeddings):
         self.client_id = client_name.strip().lower().replace(" ", "_")
-        self.embeddings_model = embeddings_model
-        self.client = supabase
+        self.embeddings = embeddings
+        self.db = supabase
 
-    def add_documents(self, docs):
-        texts = [doc.page_content for doc in docs if doc.page_content.strip()]
-        if not texts:
-            return
-        
-        # Embed documents using OpenAIEmbeddings
-        embeddings = self.embeddings_model.embed_documents(texts)
-        
-        # Insert each chunk into Supabase
-        for text, emb in zip(texts, embeddings):
-            data = {
+    def add_texts(self, texts, metadatas=None) -> int:
+        pairs = [
+            (t, (metadatas[i] if metadatas else {}))
+            for i, t in enumerate(texts)
+            if t and t.strip()
+        ]
+        if not pairs:
+            return 0
+        vectors = self.embeddings.embed_documents([t for t, _ in pairs])
+        rows = [
+            {
                 "client_id": self.client_id,
                 "content": text,
-                "metadata": {"source": "langchain_upload"},
-                "embedding": emb
+                "metadata": meta,
+                "embedding": vec,
             }
-            self.client.table("client_knowledge_base").insert(data).execute()
+            for (text, meta), vec in zip(pairs, vectors)
+        ]
+        for i in range(0, len(rows), self.BATCH):  # batched inserts
+            self.db.table(self.TABLE).insert(rows[i : i + self.BATCH]).execute()
+        return len(rows)
 
-    def get_document_count(self):
+    def add_documents(self, docs) -> int:
+        return self.add_texts(
+            [d.page_content for d in docs], [d.metadata for d in docs]
+        )
+
+    def count(self) -> int:
         try:
-            response = self.client.table("client_knowledge_base") \
-                .select("id", count="exact") \
-                .eq("client_id", self.client_id) \
+            res = (
+                self.db.table(self.TABLE)
+                .select("id", count="exact")
+                .eq("client_id", self.client_id)
                 .execute()
-            return response.count if response.count is not None else 0
+            )
+            return res.count or 0
         except Exception:
             return 0
 
-    def similarity_search(self, query, k=3):
-        # 1. Embed user query
-        query_emb = self.embeddings_model.embed_query(query)
-        
+    def search(self, query: str, k: int = 3):
         try:
-            # 2. Call Supabase RPC function for fast vector search
-            rpc_response = self.client.rpc(
+            emb = self.embeddings.embed_query(query)
+            res = self.db.rpc(
                 "match_client_documents",
                 {
-                    "query_embedding": query_emb,
+                    "query_embedding": emb,
                     "match_threshold": 0.2,
                     "match_count": k,
-                    "p_client_id": self.client_id
-                }
+                    "p_client_id": self.client_id,
+                },
             ).execute()
-            
-            matches = rpc_response.data
-            return [match["content"] for match in matches] if matches else []
+            return res.data or []
         except Exception as e:
             st.error(f"Vector search error: {e}")
             return []
 
 
-# --- UI Layout ---
-st.title("🏢 Enterprise Client RAG Portal")
-st.markdown(
-    "Demonstration system: Create or select a client workspace, upload documents, sync personal Google data, and query their dedicated Supabase knowledge base."
+# ---------- Chain ----------
+PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a professional, helpful assistant for {client}.\n"
+            "Use the retrieved context below to answer questions accurately.\n"
+            "If the answer is not in the context, politely say it is outside the "
+            "knowledge base.\n"
+            "Keep your answers concise and professional.\n\nContext:\n{context}",
+        ),
+        ("human", "{question}"),
+    ]
 )
 
-# Sidebar for Client Workspace Setup
+
+def answer(client: str, question: str, chunks: list) -> str:
+    context = (
+        "\n\n".join(c["content"] for c in chunks)
+        if chunks
+        else "No matching documents found in client knowledge base."
+    )
+    chain = PROMPT | get_llm() | StrOutputParser()
+    return chain.invoke({"client": client, "question": question, "context": context})
+
+
+# ---------- Google OAuth return handling (runs before widgets) ----------
+google_cfg = get_google_config()
+
+if "client_name" not in st.session_state:
+    st.session_state["client_name"] = "Demo Company"
+
+params = st.query_params
+if google_cfg and "code" in params and "google_creds" not in st.session_state:
+    try:
+        flow = make_flow(*google_cfg)
+        st.session_state["google_creds"] = exchange_code(flow, params["code"])
+        st.session_state["google_email"] = get_account_email(
+            st.session_state["google_creds"]
+        )
+        restored = decode_state(params.get("state", ""))
+        if restored:
+            st.session_state["client_name"] = restored  # keep the workspace
+    except Exception as e:
+        st.session_state["google_error"] = str(e)
+    st.query_params.clear()
+    st.rerun()
+
+
+# ---------- UI ----------
+st.title("🏢 Enterprise Client RAG Portal")
+st.markdown(
+    "Create or select a client workspace, upload documents, sync Google data, "
+    "and chat against that client's knowledge base."
+)
+
 with st.sidebar:
     st.header("⚙️ Workspace Setup")
-    client_name = st.text_input(
-        "Client / Company Name", value="Demo Company", max_chars=50
-    )
-
-    if not client_name:
+    client_name = st.text_input("Client / Company Name", key="client_name", max_chars=50)
+    if not client_name.strip():
         st.warning("Please enter a client name to proceed.")
         st.stop()
 
-    # Initialize client-specific vector store wrapper
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vector_store = SupabaseClientVectorStore(client_name, embeddings)
+    vector_store = SupabaseClientVectorStore(client_name, get_embeddings())
 
     st.divider()
     st.header("📂 Ingest Knowledge Base")
 
-    # Option 1: Upload PDF
-    uploaded_file = st.file_uploader(
-        "Upload Client PDF Document", type=["pdf"]
-    )
-    if uploaded_file is not None:
-        temp_pdf_path = os.path.join(".", uploaded_file.name)
-        with open(temp_pdf_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 
-        if st.button("Process & Save PDF to Supabase"):
-            with st.spinner("Parsing and vectorizing PDF into cloud storage..."):
-                loader = PyPDFLoader(temp_pdf_path)
-                pages = loader.load()
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500, chunk_overlap=50
-                )
-                docs = text_splitter.split_documents(pages)
-                vector_store.add_documents(docs)
-                os.remove(temp_pdf_path)
-            st.success(f"Added {len(docs)} chunks to {client_name}'s cloud memory!")
-            st.rerun()
+    uploaded = st.file_uploader("Upload Client PDF Document", type=["pdf"])
+    if uploaded is not None and st.button("Process & Save PDF"):
+        with st.spinner("Parsing and vectorizing PDF..."):
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(uploaded.getbuffer())
+                tmp_path = tmp.name
+            try:
+                pages = PyPDFLoader(tmp_path).load()
+            finally:
+                os.remove(tmp_path)
+            for p in pages:
+                p.metadata = {
+                    "source": uploaded.name,
+                    "page": p.metadata.get("page"),
+                }
+            docs = splitter.split_documents(pages)
+            added = vector_store.add_documents(docs)
+        st.success(f"Added {added} chunks to {client_name}.")
+        st.rerun()
 
     st.markdown("---")
-
-    # Option 2: Paste Raw Text / Custom FAQ
-    raw_text_input = st.text_area(
-        "Or Paste Custom FAQ / Policy Text",
+    raw_text = st.text_area(
+        "Or paste custom FAQ / policy text",
         placeholder="Type or paste company data here...",
     )
-    if st.button("Save Raw Text to Cloud Memory"):
-        if raw_text_input.strip():
+    if st.button("Save Text"):
+        if raw_text.strip():
             with st.spinner("Vectorizing text..."):
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500, chunk_overlap=50
+                docs = splitter.create_documents(
+                    [raw_text], metadatas=[{"source": "pasted_text"}]
                 )
-                docs = text_splitter.create_documents([raw_text_input])
-                vector_store.add_documents(docs)
-            st.success(
-                f"Successfully saved text chunk to {client_name}'s cloud memory!"
-            )
+                added = vector_store.add_documents(docs)
+            st.success(f"Saved {added} chunks to {client_name}.")
             st.rerun()
         else:
             st.error("Please enter some text before saving.")
 
     st.divider()
 
-    # Option 3: Google Workspace Cloud Sync
     with st.expander("🌐 Google Cloud Sync"):
-        st.markdown("Pull live data from your personal Gmail & Calendar into **" + client_name + "**.")
-        
-        email_limit = st.slider("Max Emails to Sync", 1, 20, 5)
-        calendar_limit = st.slider("Max Calendar Events to Sync", 1, 20, 10)
+        if not google_cfg:
+            st.info(
+                "Google sync is not configured. Add a `[google]` block with "
+                "`client_id`, `client_secret` and `redirect_uri` to your secrets."
+            )
+        else:
+            if st.session_state.get("google_error"):
+                st.error(f"Google sign-in failed: {st.session_state.pop('google_error')}")
 
-        if st.button("Sync Gmail & Calendar"):
-            with st.spinner("Connecting to Google APIs... (Check your browser for OAuth sign-in if prompted)"):
-                try:
-                    from google_sync import sync_live_gmail_to_supabase, sync_live_calendar_to_supabase
-                    
-                    # Run syncs for the current active client/workspace
-                    emails_count = sync_live_gmail_to_supabase(vector_store, openai_client, max_results=email_limit)
-                    events_count = sync_live_calendar_to_supabase(vector_store, openai_client, max_results=calendar_limit)
-                    
-                    st.success(f"Synced {emails_count} emails and {events_count} events successfully!")
+            creds = st.session_state.get("google_creds")
+            if not creds:
+                flow = make_flow(*google_cfg)
+                st.link_button(
+                    "Sign in with Google", get_auth_url(flow, client_name)
+                )
+                st.caption(
+                    "Sign-in opens in a new tab and continues there. "
+                    "You can pick any Google account."
+                )
+            else:
+                st.success(f"Signed in as {st.session_state.get('google_email', 'Google user')}")
+                email_limit = st.slider("Max emails to sync", 1, 20, 5)
+                cal_limit = st.slider("Max calendar events to sync", 1, 20, 10)
+
+                if st.button("Sync Gmail & Calendar"):
+                    with st.spinner("Syncing..."):
+                        try:
+                            n_mail = sync_gmail(vector_store, creds, email_limit)
+                            n_cal = sync_calendar(vector_store, creds, cal_limit)
+                            st.success(f"Synced {n_mail} emails and {n_cal} events.")
+                        except Exception as e:
+                            st.error(f"Google sync failed: {e}")
+
+                if st.button("Sign out of Google"):
+                    st.session_state.pop("google_creds", None)
+                    st.session_state.pop("google_email", None)
                     st.rerun()
-                except Exception as e:
-                    st.error(f"Google sync failed: {e}")
 
     st.divider()
-    st.metric(
-        label=f"Active Knowledge Chunks ({client_name})",
-        value=vector_store.get_document_count(),
-    )
+    st.metric(f"Knowledge chunks ({client_name})", vector_store.count())
 
 
-# --- Build Agent for Active Client ---
-@st.cache_resource
-def get_support_agent(client_key):
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    store = SupabaseClientVectorStore(client_key, OpenAIEmbeddings(model="text-embedding-3-small"))
-
-    retrieve_runnable = RunnableLambda(
-        lambda query: store.similarity_search(query, k=3)
-    )
-    format_runnable = RunnableLambda(
-        lambda docs: (
-            "\n\n".join(docs)
-            if docs
-            else "No matching documents found in client knowledge base."
-        )
-    )
-
-    system_prompt = (
-        f"You are a professional, helpful assistant for {client_key}.\n"
-        "Use the retrieved context below to answer questions accurately.\n"
-        "If you do not know the answer based on the context, politely inform the user that it is outside the knowledge base.\n"
-        "Keep your answers concise and professional.\n\nContext: {context}"
-    )
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{question}"),
-    ])
-
-    chain = (
-        {
-            "context": retrieve_runnable | format_runnable,
-            "question": RunnablePassthrough(),
-        }
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
-    return chain
-
-
-agent = get_support_agent(client_name)
-
-# --- Main Chat Interface ---
+# ---------- Chat ----------
 st.subheader(f"💬 Live Support Chat: {client_name}")
 
-# Maintain separate session state history per client
-session_key = f"messages_{client_name}"
-if session_key not in st.session_state:
-    st.session_state[session_key] = []
+history_key = f"messages_{vector_store.client_id}"
+st.session_state.setdefault(history_key, [])
 
-# Display chat history
-for message in st.session_state[session_key]:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+for msg in st.session_state[history_key]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-# User prompt input
-if prompt := st.chat_input(f"Ask a question about {client_name}..."):
-    st.session_state[session_key].append({"role": "user", "content": prompt})
+if question := st.chat_input(f"Ask a question about {client_name}..."):
+    st.session_state[history_key].append({"role": "user", "content": question})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(question)
 
     with st.chat_message("assistant"):
         with st.spinner("Searching records and generating response..."):
-            # 1. Fetch retrieved chunks explicitly so we can inspect them
-            retrieved_chunks = vector_store.similarity_search(prompt, k=3)
-            
-            # 2. Generate response using the agent
-            response = agent.invoke(prompt)
-            
-            # 3. Display the answer
-            st.markdown(response)
-            
-            # 4. Debug Expander to see what source chunks were used!
-            with st.expander("🔍 View Retrieved Source Chunks (Debug)"):
-                if retrieved_chunks:
-                    for i, chunk in enumerate(retrieved_chunks):
-                        st.markdown(f"**Chunk {i+1}:**")
-                        st.text(chunk)
+            chunks = vector_store.search(question, k=3)  # retrieval runs once
+            reply = answer(client_name, question, chunks)
+            st.markdown(reply)
+
+            with st.expander("🔍 Retrieved source chunks (debug)"):
+                if chunks:
+                    for i, c in enumerate(chunks, 1):
+                        meta = c.get("metadata") or {}
+                        label = meta.get("source", "unknown")
+                        if meta.get("page") is not None:
+                            label += f" · page {meta['page'] + 1}"
+                        st.markdown(f"**Chunk {i}** — {label}")
+                        st.text(c["content"])
                 else:
                     st.info("No relevant chunks retrieved for this query.")
 
-    st.session_state[session_key].append(
-        {"role": "assistant", "content": response}
-    )
+    st.session_state[history_key].append({"role": "assistant", "content": reply})

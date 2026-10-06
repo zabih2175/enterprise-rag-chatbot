@@ -1,110 +1,137 @@
-import os
-from datetime import datetime
-from google.auth.transport.requests import Request
+"""Google OAuth (web flow) + Gmail/Calendar sync into the vector store."""
+import base64
+from datetime import datetime, timezone
+
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
-# Scopes required for reading Gmail and Calendar
 SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/calendar.readonly'
+    "[googleapis.com](https://www.googleapis.com/auth/gmail.readonly)",
+    "[googleapis.com](https://www.googleapis.com/auth/calendar.readonly)",
 ]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
-TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
 
-def get_google_service(api_name, version):
-    """Handles OAuth2 authentication and saves token.json automatically using absolute paths."""
-    creds = None
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CREDENTIALS_PATH):
-                raise FileNotFoundError(f"credentials.json not found at {CREDENTIALS_PATH}. Ensure Supabase/Google secrets are configured.")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0, open_browser=False)
-        with open(TOKEN_PATH, 'w') as token:
-            token.write(creds.to_json())
-            
-    return build(api_name, version, credentials=creds)
-
-def sync_live_gmail_to_supabase(vector_store, openai_client, max_results=5):
-    """Fetches recent emails and pushes them into Supabase vector store."""
-    service = get_google_service('gmail', 'v1')
-    results = service.users().messages().list(userId='me', maxResults=max_results).execute()
-    messages = results.get('messages', [])
-    
-    synced_count = 0
-    for msg_info in messages:
-        msg = service.users().messages().get(userId='me', id=msg_info['id']).execute()
-        headers = msg['payload']['headers']
-        
-        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
-        sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
-        date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
-        snippet = msg.get('snippet', '')
-        
-        content = f"Email Subject: {subject}\nSender: {sender}\nDate: {date}\n\nSnippet/Body:\n{snippet}"
-        
-        # Generate embedding via OpenAI
-        response = openai_client.embeddings.create(
-            input=[content],
-            model="text-embedding-3-small"
-        )
-        embedding = response.data[0].embedding
-        
-        # Insert into Supabase table matching your current tenant/workspace schema
-        data = {
-            "client_id": vector_store.client_id,
-            "content": content,
-            "metadata": {"source": "gmail_api", "subject": subject},
-            "embedding": embedding
+# ---------- OAuth ----------
+def make_flow(client_id: str, client_secret: str, redirect_uri: str) -> Flow:
+    config = {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "[accounts.google.com](https://accounts.google.com/o/oauth2/auth)",
+            "token_uri": "[oauth2.googleapis.com](https://oauth2.googleapis.com/token)",
+            "redirect_uris": [redirect_uri],
         }
-        
-        vector_store.client.table("client_knowledge_base").insert(data).execute()
-        synced_count += 1
-        
-    return synced_count
+    }
+    # PKCE is off because the page reloads after the redirect and a code
+    # verifier could not be carried over.
+    return Flow.from_client_config(
+        config,
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+        autogenerate_code_verifier=False,
+    )
 
-def sync_live_calendar_to_supabase(vector_store, openai_client, max_results=10):
-    """Fetches upcoming calendar events and pushes them into Supabase vector store."""
-    service = get_google_service('calendar', 'v3')
-    now = datetime.utcnow().isoformat() + 'Z'
-    
-    events_result = service.events().list(
-        calendarId='primary', timeMin=now,
-        maxResults=max_results, singleEvents=True,
-        orderBy='startTime').execute()
-    events = events_result.get('items', [])
-    
-    synced_count = 0
-    for event in events:
-        start = event['start'].get('dateTime', event['start'].get('date'))
-        summary = event.get('summary', 'Untitled Event')
-        description = event.get('description', 'No description provided.')
-        
-        content = f"Calendar Event: {summary}\nDate/Time: {start}\nDescription: {description}"
-        
-        response = openai_client.embeddings.create(
-            input=[content],
-            model="text-embedding-3-small"
+
+def encode_state(client_name: str) -> str:
+    return base64.urlsafe_b64encode(client_name.encode()).decode()
+
+
+def decode_state(state: str) -> str:
+    try:
+        return base64.urlsafe_b64decode(state.encode()).decode()
+    except Exception:
+        return ""
+
+
+def get_auth_url(flow: Flow, client_name: str) -> str:
+    url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent select_account",  # always show the account picker
+        include_granted_scopes="true",
+        state=encode_state(client_name),
+    )
+    return url
+
+
+def exchange_code(flow: Flow, code: str) -> dict:
+    flow.fetch_token(code=code)
+    return {
+        "token": flow.credentials.token,
+        "refresh_token": flow.credentials.refresh_token,
+        "token_uri": flow.credentials.token_uri,
+        "client_id": flow.credentials.client_id,
+        "client_secret": flow.credentials.client_secret,
+        "scopes": list(flow.credentials.scopes or SCOPES),
+    }
+
+
+def _service(creds_info: dict, api: str, version: str):
+    creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
+    return build(api, version, credentials=creds, cache_discovery=False)
+
+
+def get_account_email(creds_info: dict) -> str:
+    profile = _service(creds_info, "gmail", "v1").users().getProfile(userId="me").execute()
+    return profile.get("emailAddress", "")
+
+
+# ---------- Sync ----------
+def sync_gmail(vector_store, creds_info: dict, max_results: int = 5) -> int:
+    service = _service(creds_info, "gmail", "v1")
+    listing = service.users().messages().list(userId="me", maxResults=max_results).execute()
+
+    texts, metas = [], []
+    for item in listing.get("messages", []):
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=item["id"],
+                format="metadata",
+                metadataHeaders=["Subject", "From", "Date"],
+            )
+            .execute()
         )
-        embedding = response.data[0].embedding
-        
-        data = {
-            "client_id": vector_store.client_id,
-            "content": content,
-            "metadata": {"source": "calendar_api", "event": summary},
-            "embedding": embedding
-        }
-        
-        vector_store.client.table("client_knowledge_base").insert(data).execute()
-        synced_count += 1
-        
-    return synced_count
+        headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
+        subject = headers.get("Subject", "No Subject")
+        texts.append(
+            f"Email Subject: {subject}\n"
+            f"Sender: {headers.get('From', 'Unknown Sender')}\n"
+            f"Date: {headers.get('Date', 'Unknown Date')}\n\n"
+            f"Snippet:\n{msg.get('snippet', '')}"
+        )
+        metas.append({"source": "gmail", "subject": subject, "message_id": item["id"]})
+
+    return vector_store.add_texts(texts, metas)
+
+
+def sync_calendar(vector_store, creds_info: dict, max_results: int = 10) -> int:
+    service = _service(creds_info, "calendar", "v3")
+    now = datetime.now(timezone.utc).isoformat()
+    events = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=now,
+            maxResults=max_results,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+        .get("items", [])
+    )
+
+    texts, metas = [], []
+    for ev in events:
+        start = ev["start"].get("dateTime", ev["start"].get("date"))
+        summary = ev.get("summary", "Untitled Event")
+        texts.append(
+            f"Calendar Event: {summary}\n"
+            f"Date/Time: {start}\n"
+            f"Description: {ev.get('description', 'No description provided.')}"
+        )
+        metas.append({"source": "calendar", "event": summary, "event_id": ev.get("id")})
+
+    return vector_store.add_texts(texts, metas)
