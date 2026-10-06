@@ -28,7 +28,7 @@ def get_google_service(api_name, version):
             if not os.path.exists(CREDENTIALS_PATH):
                 raise FileNotFoundError(f"credentials.json not found at {CREDENTIALS_PATH}. Ensure Supabase/Google secrets are configured.")
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=0, open_browser=False)
         with open(TOKEN_PATH, 'w') as token:
             token.write(creds.to_json())
             
